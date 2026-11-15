@@ -5,15 +5,15 @@ Run with no arguments:
     python scraper.py
 
 The scraper starts at page 1, follows the "Next" link until the last page
-(the page count is discovered, not hardcoded).
-
-Work in progress: this version only walks through the pages.
+(the page count is discovered, not hardcoded) and extracts every quote,
+its author and its tags. (Work in progress: output files come next.)
 """
 
 import logging
 import random
 import sys
 import time
+from datetime import datetime
 from urllib.parse import urljoin
 
 import requests
@@ -32,6 +32,9 @@ MAX_ATTEMPTS = 3              # 1 try + 2 retries
 RETRY_WAIT = 3                # seconds to wait before retrying a request
 MIN_DELAY = 1.0               # polite delay between requests, in seconds
 MAX_DELAY = 2.0
+
+OPENING_MARKS = ("“", '"')   # the quotation marks wrapping each quote
+CLOSING_MARKS = ("”", '"')
 
 log = logging.getLogger("scraper")
 
@@ -74,8 +77,43 @@ def polite_delay():
 
 
 # ---------------------------------------------------------------------------
-# Pagination
+# Parsing
 # ---------------------------------------------------------------------------
+def clean_quote_text(text):
+    """Strip the surrounding quotation marks and whitespace from a quote.
+
+    Only the outer pair is removed, so quotation marks inside the quote stay.
+    """
+    text = text.strip()
+    if text.startswith(OPENING_MARKS):
+        text = text[1:]
+    if text.endswith(CLOSING_MARKS):
+        text = text[:-1]
+    return text.strip()
+
+
+def parse_quotes(soup, page_number, scraped_at):
+    """Extract every quote on one page as a list of record dictionaries."""
+    records = []
+    for block in soup.select("div.quote"):
+        text = block.select_one("span.text")
+        author = block.select_one("small.author")
+        if text is None or author is None:
+            log.warning("Skipping a malformed quote block on page %d",
+                        page_number)
+            continue
+        records.append({
+            "quote": clean_quote_text(text.get_text()),
+            "author": author.get_text(strip=True),
+            # A quote with no tags gets an empty list, not a missing field
+            "tags": [tag.get_text(strip=True)
+                     for tag in block.select("div.tags a.tag")],
+            "page": page_number,
+            "scraped_at": scraped_at,
+        })
+    return records
+
+
 def find_next_url(soup, current_url):
     """Return the absolute URL of the next page, or None on the last page.
 
@@ -91,12 +129,14 @@ def find_next_url(soup, current_url):
 # ---------------------------------------------------------------------------
 # Scraping loop
 # ---------------------------------------------------------------------------
-def crawl_pages(session, start_url):
-    """Follow the pagination from start_url until there is no next page.
+def scrape_all_pages(session, start_url, scraped_at):
+    """Follow the pagination from start_url and collect every quote.
 
-    Returns (pages_fetched, error). error is None on success, or a message
-    if a page could not be fetched.
+    Returns (records, pages_fetched, error). error is None on success, or a
+    message if a page could not be fetched; the quotes collected before that
+    page are still returned so the run can stop cleanly.
     """
+    records = []
     pages_fetched = 0
     url = start_url
     while url:
@@ -104,31 +144,46 @@ def crawl_pages(session, start_url):
             polite_delay()
         html = fetch_page(session, url)
         if html is None:
-            return pages_fetched, f"could not fetch {url}"
+            return records, pages_fetched, f"could not fetch {url}"
         pages_fetched += 1
         soup = BeautifulSoup(html, "html.parser")
-        log.info("Page %d fetched (%s)", pages_fetched, url)
+        page_records = parse_quotes(soup, pages_fetched, scraped_at)
+        records.extend(page_records)
+        log.info("Page %d: %d quotes (%s)", pages_fetched,
+                 len(page_records), url)
         url = find_next_url(soup, url)
-    return pages_fetched, None
+    return records, pages_fetched, None
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def print_summary(pages_fetched, records, error):
+    """Print pages fetched and quotes extracted."""
+    print()
+    print(f"Pages fetched:    {pages_fetched}")
+    print(f"Quotes extracted: {len(records)}")
+    print(f"Authors:          {len({r['author'] for r in records})}")
+    if error:
+        print(f"Stopped early:    {error}")
+
+
 def main():
-    """Walk through every page and print how many were fetched."""
+    """Scrape all pages and print a summary."""
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s",
                         datefmt="%H:%M:%S")
+    scraped_at = datetime.now().isoformat(timespec="seconds")
     session = create_session()
     try:
-        pages, error = crawl_pages(session, BASE_URL)
+        records, pages, error = scrape_all_pages(session, BASE_URL,
+                                                 scraped_at)
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
         return 130
-    print(f"\nPages fetched: {pages}")
-    if error:
-        print(f"Stopped early: {error}")
+    for record in records[:3]:
+        print(record)
+    print_summary(pages, records, error)
     return 1 if error else 0
 
 
