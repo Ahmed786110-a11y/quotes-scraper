@@ -5,18 +5,23 @@ Run with no arguments:
     python scraper.py
 
 The scraper starts at page 1, follows the "Next" link until the last page
-(the page count is discovered, not hardcoded) and extracts every quote,
-its author and its tags. (Work in progress: output files come next.)
+(the page count is discovered, not hardcoded), and writes the same records
+to output/quotes.json, output/quotes.csv, output/quotes.txt and
+output/quotes.yaml. Each run overwrites the four files.
 """
 
+import csv
+import json
 import logging
 import random
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
+import yaml
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
@@ -33,6 +38,11 @@ RETRY_WAIT = 3                # seconds to wait before retrying a request
 MIN_DELAY = 1.0               # polite delay between requests, in seconds
 MAX_DELAY = 2.0
 
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+OUTPUT_NAME = "quotes"
+FIELDS = ["quote", "author", "tags", "page", "scraped_at"]
+CSV_TAG_SEPARATOR = ";"
+TEXT_TAG_SEPARATOR = ", "
 OPENING_MARKS = ("“", '"')   # the quotation marks wrapping each quote
 CLOSING_MARKS = ("”", '"')
 
@@ -156,34 +166,120 @@ def scrape_all_pages(session, start_url, scraped_at):
 
 
 # ---------------------------------------------------------------------------
+# Writing the four output files
+# ---------------------------------------------------------------------------
+def write_json(records, path):
+    """Write the records as one JSON array indented two spaces."""
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(records, file, indent=2, ensure_ascii=False)
+        file.write("\n")
+
+
+def write_csv(records, path):
+    """Write one CSV row per quote, tags joined with semicolons.
+
+    The csv module escapes commas and quotation marks inside the text.
+    """
+    with open(path, "w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=FIELDS)
+        writer.writeheader()
+        for record in records:
+            row = dict(record)
+            row["tags"] = CSV_TAG_SEPARATOR.join(record["tags"])
+            writer.writerow(row)
+
+
+def write_text(records, path):
+    """Write one labelled block per quote, with a blank line between blocks."""
+    blocks = []
+    for record in records:
+        blocks.append("\n".join([
+            f"Quote: {record['quote']}",
+            f"Author: {record['author']}",
+            f"Tags: {TEXT_TAG_SEPARATOR.join(record['tags'])}",
+            f"Page: {record['page']}",
+            f"Scraped: {record['scraped_at']}",
+        ]))
+    with open(path, "w", encoding="utf-8") as file:
+        # rstrip() avoids a trailing space on "Tags: " when a quote has none
+        file.write("\n\n".join(
+            "\n".join(line.rstrip() for line in block.splitlines())
+            for block in blocks))
+        file.write("\n")
+
+
+def write_yaml(records, path):
+    """Write the records as a YAML list of mappings with yaml.safe_dump."""
+    with open(path, "w", encoding="utf-8") as file:
+        yaml.safe_dump(records, file, sort_keys=False, allow_unicode=True,
+                       default_flow_style=False)
+
+
+WRITERS = {
+    "json": write_json,
+    "csv": write_csv,
+    "txt": write_text,
+    "yaml": write_yaml,
+}
+
+
+def write_outputs(records, output_dir):
+    """Write all four formats (overwriting old files); return the paths."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for extension, writer in WRITERS.items():
+        path = output_dir / f"{OUTPUT_NAME}.{extension}"
+        writer(records, path)
+        written.append(path)
+    return written
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def print_summary(pages_fetched, records, error):
-    """Print pages fetched and quotes extracted."""
+def print_summary(pages_fetched, records, written, error):
+    """Print pages fetched, quotes extracted and files written."""
     print()
+    print("=" * 50)
+    print("Scrape summary")
+    print("=" * 50)
     print(f"Pages fetched:    {pages_fetched}")
     print(f"Quotes extracted: {len(records)}")
     print(f"Authors:          {len({r['author'] for r in records})}")
+    print(f"Files written:    {len(written)}")
+    for path in written:
+        print(f"  - {path}")
     if error:
         print(f"Stopped early:    {error}")
+    print("=" * 50)
 
 
 def main():
-    """Scrape all pages and print a summary."""
+    """Scrape all pages, write the output files and print a summary."""
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s",
                         datefmt="%H:%M:%S")
     scraped_at = datetime.now().isoformat(timespec="seconds")
     session = create_session()
+
     try:
         records, pages, error = scrape_all_pages(session, BASE_URL,
                                                  scraped_at)
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        print("\nInterrupted by user - no files written.")
         return 130
-    for record in records[:3]:
-        print(record)
-    print_summary(pages, records, error)
+
+    written = []
+    if records:
+        try:
+            written = write_outputs(records, OUTPUT_DIR)
+        except OSError as os_error:
+            error = f"could not write output files: {os_error}"
+    else:
+        # Keep the previous output files rather than overwrite them
+        error = error or "no quotes found"
+
+    print_summary(pages, records, written, error)
     return 1 if error else 0
 
 
